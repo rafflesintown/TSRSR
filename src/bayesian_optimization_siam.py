@@ -1,0 +1,1984 @@
+import os
+import csv
+import copy
+import json
+import imageio.v2 as imageio
+import datetime
+import warnings
+import itertools
+import __main__
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
+from tqdm import tqdm
+from matplotlib import cm
+from scipy.stats import norm
+from scipy.optimize import minimize
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from sklearn.utils import check_random_state
+from sklearn.preprocessing import StandardScaler
+from sklearn.gaussian_process import kernels, GaussianProcessRegressor
+import torch
+import gpytorch
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+
+class ExactGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel())
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+class TorchGPModel():
+    def __init__(self, X, Y, alg_name=None, n_workers = None, objective_name = None, likelihood_noise = 1e-6):
+        self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
+        self.likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_constraint=gpytorch.constraints.GreaterThan(1e-6))
+        self.likelihood.noise = likelihood_noise
+        self.likelihood.noise_covar.raw_noise.requires_grad_(False)
+        print("GP INITIAL NOISE", self.likelihood.noise)
+        self.model = ExactGPModel(X, Y, self.likelihood)
+        print("objective name", objective_name)
+        if objective_name == 'rastrigin':
+            self.model.covar_module.base_kernel.lengthscale = 0.1
+            print("self module length scale if rastrigin", self.model.covar_module.base_kernel.lengthscale.item())
+        if objective_name == 'Boston':
+            self.model.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(ard_num_dims = 4))
+            self.model.covar_module.base_kernel.lengthscale = torch.tensor([0.1, 0.005, 0.1,0.1])
+        if objective_name == 'bCancer':
+            self.model.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(ard_num_dims = 4))
+            self.model.covar_module.base_kernel.lengthscale = torch.tensor([0.5, 0.05, 0.1,0.1])
+        if objective_name == 'Hartmann6d':
+            self.model.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(ard_num_dims = 6))
+            self.model.covar_module.base_kernel.lengthscale = torch.tensor([0.2] * 6)
+        if objective_name == 'robot3d':
+            self.model.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(ard_num_dims = 3))
+            self.model.covar_module.base_kernel.lengthscale = torch.tensor([1.0, 1.0, 0.1])
+            print("initial output scale for robot3d", self.model.covar_module.outputscale)
+            self.model.covar_module.outputscale = 0.2
+            print("initial output scale for robot3d now", self.model.covar_module.outputscale)
+        if objective_name == 'simGP1d_rbf':
+            self.model.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims = 1))
+            self.model.covar_module.base_kernel.lengthscale = 0.05
+            print("self module length scale for simGP1d_rbf", self.model.covar_module.base_kernel.lengthscale.item())
+        if objective_name.startswith('simGP2d_rbf'):
+            self.model.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims = 2))
+            self.model.covar_module.base_kernel.lengthscale = 0.05
+            self.model.covar_module.outputscale = 10.
+        if objective_name.startswith('simGP3d_rbf'):
+            self.model.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims = 3))
+            self.model.covar_module.base_kernel.lengthscale = 0.15
+            # self.model.covar_module.outputscale = 10.
+            # self.model.covar_module.base_kernel.lengthscale = 0.125
+            self.model.covar_module.outputscale = 10.
+            # print("self module length scale for simGP1d_rbf", self.model.covar_module.base_kernel.lengthscale.item())
+        if objective_name.startswith('simGP_rf_dim=2'):
+            self.model.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims = 2))
+            self.model.covar_module.base_kernel.lengthscale = 0.25
+
+
+
+
+    def fit(self, X, Y):
+        if isinstance(X, list):
+            X = np.array(X)
+        if isinstance(X, np.ndarray):
+            X = torch.tensor(X).float()
+        if isinstance(Y, np.ndarray):
+            Y = torch.tensor(Y).float()
+        if len(X.shape) == 2:
+            X = X
+        if len(Y.shape) == 2:
+            Y = torch.reshape(Y, [-1, ])
+        # try:
+        self.model.set_train_data(X, Y, strict=False)
+        # except:
+        #     self.__init__(X, Y, likelihood)
+
+    def predict(self, X, return_std= False, return_cov = False, return_tensor=False):
+        self.model.eval()
+        self.likelihood.eval()
+        if isinstance(X, np.ndarray):
+            X = torch.tensor(X).float()
+        if len(X.shape) == 1:
+            X = torch.reshape(X, [1, -1])
+        with gpytorch.settings.fast_pred_var():
+            f_pred = self.model(X)
+            if return_tensor:
+                if return_std:
+                    return f_pred.mean, f_pred.variance
+                elif return_cov:
+                    return f_pred.mean, f_pred.covariance_matrix
+                else:
+                    return f_pred.mean
+            else:
+                if return_std:
+                    return f_pred.mean.detach().numpy(), f_pred.variance.detach().numpy()
+                elif return_cov:
+                    return f_pred.mean.detach().numpy(), f_pred.covariance_matrix.detach().numpy()
+                else:
+                    return f_pred.mean.detach().numpy()
+
+    def sample_y(self, X, n_samples, random_state = None):
+        rng = check_random_state(random_state)
+        # print(" I am here")
+        # print(" X shaoe", X.shape)
+        y_mean, y_cov = self.predict(X, return_cov=True)
+        # print("y_mean")
+        if y_mean.ndim == 1:
+            y_samples = rng.multivariate_normal(y_mean, y_cov, n_samples).T
+        else:
+            y_samples = [
+                rng.multivariate_normal(
+                    y_mean[:, target], y_cov[..., target], n_samples
+                ).T[:, np.newaxis]
+                for target in range(y_mean.shape[1])
+            ]
+            y_samples = np.hstack(y_samples)
+        return y_samples
+
+    @property
+    def y_train_(self):
+        return self.model.train_targets.detach().numpy()
+
+    @property
+    def X_train_(self):
+      return self.model.train_inputs[0].detach().numpy()
+
+
+class BatchBayesianOptimization():
+    def __init__(self, objective, domain, arg_max = None, n_workers = 1,
+                 network = None, kernel = kernels.RBF(), alpha=10**(-10),
+                 acquisition_function = 'ei', policy = 'greedy',
+                 grid_density = 100, x0=None, n_ysamples = 1,  args=dict()):
+        # super(BayesianOptimizationCentralized, self).__init__(objective, domain=domain, arg_max=arg_max, n_workers=n_workers,
+        #          network=network, kernel=kernel, alpha=alpha,
+        #          acquisition_function=acquisition_function, policy = policy,
+        #          grid_density = grid_density, n_ysamples = n_ysamples, args=args)
+        # print("i am here init")
+
+
+
+        self.acq_name = acquisition_function
+        if acquisition_function == 'es':
+            self._acquisition_function = self._entropy_search_grad
+        elif acquisition_function == 'bucb' or acquisition_function == 'ucbpe':
+            self._acquisition_function = self._batch_upper_confidential_bound
+            self.acq_name = acquisition_function
+        # elif acquisition_function == 'ei' and fantasies == self.n_workers:
+        #     self._acquisition_function = self._expected_improvement_fantasized
+        elif acquisition_function == 'ei': #not sure why need fantasies == self.n_workers
+            self._acquisition_function = self._expected_improvement_fantasized
+        elif acquisition_function == 'ts':
+            self._acquisition_function = self._thompson_sampling_centralized
+        elif acquisition_function == 'sp':
+            self._acquisition_function = self._stochastic_policy_centralized
+        elif acquisition_function == "ts_rsr":
+            self._acquisition_function = self._TS_RSR
+        elif acquisition_function == 'dppts':
+            self._acquisition_function = self._dppts
+        elif acquisition_function == 'sp_ei':
+            self._acquisition_function = self._stochastic_policy_EI
+        elif acquisition_function == 'qei':
+            self._acquisition_function = self._qEI
+        else:
+            print('Supported acquisition functions: ei, ts, es, bucb, ucbpe, ts_ucb(mod), ts_ucb_seq, ts_ucb_det,ts_ucb_vals, ts_rsr(mod),ts_rsr_combine')
+            return
+
+
+
+
+        #self random seed (previously  there wasn't this step)
+        self.seed = args.seed
+        # self.n_pre_samples = n_pre_samples
+
+
+        # Optimization setup
+        self.objective_name = args.objective
+        self.objective = lambda x: -objective.function(x)
+        self.max_val = -objective.min
+        if self.objective_name == 'robot3d' or self.objective_name == 'robot4d':
+            n_runs = args.n_runs
+            self.objectives = [None]* n_runs
+            self.goals = [None] *n_runs
+            # print("self objectives init", self.objectives)
+            for i in np.arange(n_runs):
+                goal = np.random.uniform(low = -5,high=5,size = 2)
+                self.goals[i] = goal
+                self.objectives[i] = lambda x, goal = goal: -objective.function(x,goal)
+                obj = self.objectives[i]
+                # print("hi here")
+                # print("hi", obj(x = np.ones(3)))
+            # print("self objectives now", self.objectives)
+
+        self.n_workers = n_workers
+        if network is None:
+            self.network = np.eye(n_workers)
+        else:
+            self.network = network
+        self._policy = policy
+        if policy not in ['greedy', 'boltzmann']:
+            print("Supported policies: 'greedy', 'boltzmann' ")
+            return
+
+
+
+        # Domain
+        self.domain = domain    #shape = [n_params, 2]
+        self._dim = domain.shape[0]
+        self._grid_density = grid_density
+        grid_elemets = []
+        if self._dim >= 5:
+            self._grid_density = int(np.maximum(10 - 2 * (self._dim - 5),2)) #reduce grid density for high dimensional problems, otherwise too slow
+        for [i,j] in self.domain:
+            # print("i j", i,j)
+            grid_elemets.append(np.linspace(i, j, self._grid_density))
+        self._grid = np.array(list(itertools.product(*grid_elemets)))
+
+        # Global Maximum
+        self.arg_max = arg_max
+        # print(" i am here initing",self.arg_max)
+        # print(" i am here initing grid shape",self._grid.shape)
+        if self.arg_max is None:
+            obj_grid = [self.objective(i) for i in self._grid]
+            self.arg_max = np.array(self._grid[np.array(obj_grid).argmax(), :]).reshape(-1, self._dim)
+            # print("this is maximum for obj = %s" % self.objective_name, np.max(np.array(obj_grid)))
+
+
+        self.scaler = [StandardScaler() for i in range(n_workers)]
+
+        # Data holders
+        self.bc_data = None
+        self.X_train = self.Y_train = None
+        self.X = self.Y = None
+        self._acquisition_evaluations = [[] for i in range(n_workers)]
+
+        # print(" i am here initing 2")
+
+        # file storage
+        self.args = args
+        # print("hi",self.args)
+        self._DT_ = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        # self._ROOT_DIR_ = os.path.dirname(os.path.dirname(__main__.__file__))
+        self._ROOT_DIR_ = "./"
+
+        alg_name = acquisition_function.upper()
+        self.alg_name = alg_name
+
+        # print(" i am here initing 3")
+
+        self.n_ysamples = n_ysamples
+
+        self._TEMP_DIR_ = os.path.join(os.path.join(self._ROOT_DIR_, "result"), self.args.objective)
+        self._ALG_DIR_ = os.path.join(self._TEMP_DIR_, alg_name)
+        self._ID_DIR_ = os.path.join(self._ALG_DIR_, self._DT_+"_nworkers=%s"%self.n_workers)
+        self._DATA_DIR_ = os.path.join(self._ID_DIR_, "data")
+        self._FIG_DIR_ = os.path.join(self._ID_DIR_, "fig")
+        self._PNG_DIR_ = os.path.join(self._FIG_DIR_, "png")
+        self._PDF_DIR_ = os.path.join(self._FIG_DIR_, "pdf")
+        self._GIF_DIR_ = os.path.join(self._FIG_DIR_, "gif")
+        for path in [self._TEMP_DIR_, self._DATA_DIR_, self._FIG_DIR_, self._PNG_DIR_, self._PDF_DIR_, self._GIF_DIR_]:
+            try:
+                os.makedirs(path)
+            except FileExistsError:
+                pass
+
+
+        self.beta = None
+        print("done with initialization")
+
+
+
+    def _regret(self, y):
+        if self.objective_name == 'Boston' or self.objective_name == 'robot3d' or self.objective_name == 'bCancer' or self.objective_name == 'robot4d':
+            return -y
+        elif self.objective_name == 'Michalewicz10d':
+            return self.max_val - y
+        elif self.objective_name.startswith('simGP_rf'):
+            return -y
+        else:
+            return self.objective(self.arg_max[0]) - y
+
+    def _mean_regret(self):
+        r_mean = [np.mean(self._simple_regret[:,iter]) for iter in range(self._simple_regret.shape[1])]
+        r_std = [np.std(self._simple_regret[:,iter]) for iter in range(self._simple_regret.shape[1])]
+        # 95% confidence interval
+        conf95 = [1.96*rst/self._simple_regret.shape[0] for rst in r_std]
+        return range(self._simple_regret.shape[1]), r_mean, conf95
+
+    def _cumulative_regret(self):
+        r_cum = [np.sum(self._simple_regret[:, : iter + 1], axis=1) for iter in range(self._simple_regret.shape[1])]
+        r_cum = np.array(r_cum).T
+        r_cum_mean = [np.mean(r_cum[:,iter]) for iter in range(r_cum.shape[1])]
+        r_std = [np.std(r_cum[:,iter]) for iter in range(r_cum.shape[1])]
+        # 95% confidence interval
+        conf95 = [1.96*rst/self._simple_regret.shape[0] for rst in r_std]
+        return range(self._simple_regret.shape[1]), r_cum_mean, conf95
+
+    def _mean_distance_traveled(self):
+        d_mean = [np.mean(self._distance_traveled[:,iter]) for iter in range(self._distance_traveled.shape[1])]
+        d_std = [np.std(self._distance_traveled[:,iter]) for iter in range(self._distance_traveled.shape[1])]
+        # 95% confidence interval
+        conf95 = [1.96*dst/self._distance_traveled.shape[0] for dst in d_std]
+        return range(self._distance_traveled.shape[1]), d_mean, conf95
+
+    def _save_data(self, data, name):
+        with open(self._DATA_DIR_ + '/config.json', 'w', encoding='utf-8') as file:
+            json.dump(vars(self.args), file, ensure_ascii=False, indent=4)
+        with open(self._DATA_DIR_ + '/' + name + '.csv', 'w', newline='') as file:
+            writer = csv.writer(file, delimiter=',')
+            for i in zip(*data):
+                writer.writerow(i)
+        return
+    
+
+
+
+
+
+    def _boltzmann(self, n, x, acq):
+        """
+        Softmax distribution on acqusition function points for stochastic query selection
+        Arguments:
+        ----------
+            n: integer
+                Iteration number.
+            x: array-like, shape = [n_samples, n_hyperparams]
+                The point for which the blotzmann needs to be computed and selected from.
+            acq: array-like, shape = [n_samples, 1]
+                The acqusition function value for x.
+        """
+        C = max(abs(max(acq)-acq))
+        if C > 10**(-2):
+            beta = 3*np.log(n+self._initial_data_size+1)/C
+            _blotzmann_prob = lambda e: np.exp(beta*e)
+            bm = [_blotzmann_prob(e) for e in acq]
+            norm_bm = [float(i)/sum(bm) for i in bm]
+            idx = np.random.choice(range(x.shape[0]), p=np.squeeze(norm_bm))
+        else:
+            idx = np.random.choice(range(x.shape[0]))
+        return x[idx]
+
+    def _find_next_query(self, n, a, random_search):
+        """
+        Proposes the next query.
+        Arguments:
+        ----------
+            n: integer
+                Iteration number.
+            agent: integer
+                Agent id to find next query for.
+            model: sklearn model
+                Surrogate model used for acqusition function
+            random_search: integer.
+                Number of random samples used to optimize the acquisition function. Default 1000
+        """
+        # Candidate set
+        x = np.random.uniform(self.domain[:, 0], self.domain[:, 1], size=(random_search, self._dim))
+
+
+        X = x[:]
+        if self._record_step:
+            X = np.append(self._grid, x).reshape(-1, self._dim)
+
+        # Calculate acquisition function
+        acq = - self._acquisition_function(a, X, n)
+
+        if self._record_step:
+            self._acquisition_evaluations[a].append(-1*acq[0:self._grid.shape[0]])
+            acq = acq[self._grid.shape[0]:]
+
+        # Apply policy
+        if self._policy == 'boltzmann':
+            # Boltzmann Policy
+            x = self._boltzmann(n, x, acq)
+        else:
+            #Greedy Policy
+            x = x[np.argmax(acq), :]
+
+        return x
+
+
+    def _broadcast(self, agent, x, y):
+        for neighbour_agent, neighbour in enumerate(self.network[agent]):
+            if neighbour and neighbour_agent != agent:
+                self.bc_data[agent][neighbour_agent].append((x,y))
+        return
+
+
+    def _plot_1d(self, iter, mu, std, acq):
+        cmap = cm.get_cmap('jet')
+        rgba = [cmap(i) for i in np.linspace(0,1,self.n_workers)]
+        if self.n_workers == 1:
+            rgba = ['k']
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10,10), sharex=True)
+
+        class ScalarFormatterForceFormat(ticker.ScalarFormatter):
+            def _set_format(self):
+                self.format = "%1.2f"
+        fmt = ScalarFormatterForceFormat()
+        fmt.set_powerlimits((0,0))
+        fmt.useMathText = True
+
+        #Objective function
+        y_obj = [self.objective(i) for i in self._grid]
+        ax1.plot(self._grid, y_obj, 'k--', lw=1)
+        for a in range(self.n_workers):
+            # Surrogate plot
+            ax1.plot(self._grid, mu[a], color = rgba[a], lw=1)
+            ax1.fill_between(np.squeeze(self._grid), np.squeeze(mu[a]) - 2*std[a], np.squeeze(mu[a]) + 2*std[a], color = rgba[a], alpha=0.1)
+            ax1.scatter(self.X[a], self.Y[a], color = rgba[a], s=20, zorder=3)
+            ax1.yaxis.set_major_formatter(fmt)
+            ax1.set_ylim(bottom = -10, top=14)
+            ax1.set_xticks(np.linspace(self._grid[0],self._grid[-1], 5))
+            # Acquisition function plot
+            ax2.plot(self._grid, acq[a], color = rgba[a], lw=1)
+            ax2.axvline(self._next_query[a], color = rgba[a], lw=1)
+            ax2.set_xlabel("x", fontsize = 16)
+            ax2.yaxis.set_major_formatter(fmt)
+            ax2.set_xticks(np.linspace(self._grid[0],self._grid[-1], 5))
+
+        ax1.tick_params(axis='both', which='major', labelsize=16)
+        ax1.tick_params(axis='both', which='minor', labelsize=16)
+        ax2.tick_params(axis='both', which='major', labelsize=16)
+        ax2.tick_params(axis='both', which='minor', labelsize=16)
+        ax1.yaxis.offsetText.set_fontsize(16)
+        ax2.yaxis.offsetText.set_fontsize(16)
+
+        # Legends
+        if self.n_workers > 1:
+            c = 'k'
+        else:
+            c = rgba[a]
+        legend_elements1 = [Line2D([0], [0], linestyle = '--', color='k', lw=0.8, label='Objective'),
+                           Line2D([0], [0], color=c, lw=0.8, label='Surrogate'),
+                           Line2D([], [], marker='o', color=c, label='Observations', markerfacecolor=c, markersize=4)]
+        leg1 = ax1.legend(handles=legend_elements1, fontsize = 16, loc='upper right', fancybox=True, framealpha=0.2)
+        ax1.add_artist(leg1)
+        ax1.legend(["Iteration %d" % (iter)], fontsize = 16, loc='upper left', handletextpad=0, handlelength=0, fancybox=True, framealpha = 0.2)
+
+
+        legend_elements2 = [ Line2D([0], [0], color=c, lw=0.8, label='Acquisition'),
+                            Line2D([], [], color=c, marker='|', linestyle='None',
+                          markersize=10, markeredgewidth=1, label='Next Query')]
+        ax2.legend(handles=legend_elements2, fontsize = 16, loc='upper right', fancybox=True, framealpha=0.5)
+
+        plt.tight_layout()
+        plt.savefig(self._PDF_DIR_ + '/bo_iteration_%d.pdf' % (iter), bbox_inches='tight')
+        plt.savefig(self._PNG_DIR_ + '/bo_iteration_%d.png' % (iter), bbox_inches='tight')
+
+
+
+    def _plot_regret(self, iter, r_mean, conf95, reward_type='instant', log = False):
+
+        use_log_scale = max(r_mean)/min(r_mean) > 10 if reward_type == 'instant' else False
+
+        if not use_log_scale:
+            # absolut error for linear scale
+            lower = [r + err for r, err in zip(r_mean, conf95)]
+            upper = [r - err for r, err in zip(r_mean, conf95)]
+        else:
+            # relative error for log scale
+            lower = [10**(np.log10(r) + (0.434*err/r)) for r, err in zip(r_mean, conf95)]
+            upper = [10**(np.log10(r) - (0.434*err/r)) for r, err in zip(r_mean, conf95)]
+
+        fig = plt.figure()
+
+        if use_log_scale:
+            plt.yscale('log')
+
+        plt.plot(iter, r_mean, '-', linewidth=1)
+        plt.fill_between(iter, upper, lower, alpha=0.3)
+        plt.xlabel('iterations')
+        plt.ylabel(reward_type + ' regret')
+        plt.grid(b=True, which='major', color='grey', linestyle='-', alpha=0.6)
+        plt.grid(b=True, which='minor', color='grey', linestyle='--', alpha=0.3)
+        plt.gca().xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+        plt.tight_layout()
+        if use_log_scale:
+            plt.savefig(self._PDF_DIR_ + '/' + reward_type + '_regret_log.pdf', bbox_inches='tight')
+            plt.savefig(self._PNG_DIR_ + '/' + reward_type + '_regret_log.png', bbox_inches='tight')
+        else:
+            plt.savefig(self._PDF_DIR_ + '/' + reward_type + '_regret.pdf', bbox_inches='tight')
+            plt.savefig(self._PNG_DIR_ + '/' + reward_type + '_regret.png', bbox_inches='tight')
+
+    def _generate_gif(self, n_iters, plot):
+        if self._dim == 1:
+            plots = []
+            for i in range(n_iters+1):
+                if plot is True or i == n_iters:
+                    try:
+                        plots.append(imageio.imread(self._PNG_DIR_ + '/bo_iteration_%d.png' % (i)))
+                    except: pass
+                elif not i % plot:
+                    try:
+                        plots.append(imageio.imread(self._PNG_DIR_ + '/bo_iteration_%d.png' % (i)))
+                    except: pass
+            imageio.mimsave(self._GIF_DIR_ + '/bo.gif', plots, duration=1.0)
+        else:
+            for a in range(self.n_workers):
+                plots = []
+                for i in range(n_iters+1):
+                    if plot is True or i == n_iters:
+                        try:
+                            plots.append(imageio.imread(self._PNG_DIR_ + '/bo_iteration_%d_agent_%d.png' % (i, a)))
+                        except: pass
+                    elif not i % plot:
+                        try:
+                            plots.append(imageio.imread(self._PNG_DIR_ + '/bo_iteration_%d_agent_%d.png' % (i, a)))
+                        except: pass
+                imageio.mimsave(self._GIF_DIR_ + '/bo_agent_%d.gif' % (a), plots, duration=1.0)
+
+
+
+
+    def _entropy_search_grad(self, a, x, n, radius=0.1):
+        """
+                Entropy search acquisition function.
+                Args:
+                    a: # agents
+                    x: array-like, shape = [n_samples, n_hyperparams]
+                    n: agent nums
+                    projection: if project to a close circle
+                    radius: circle of the projected circle
+                """
+
+        x = x.reshape(-1, self._dim)
+        # x = x.float()
+        # self.beta = 3 - 0.019 * n
+        delta = 0.01
+        self.beta = 0.1 * 2. * np.log(x.shape[0] * n**2 * np.pi**2/(6. * delta)) #compare to the Desaultels paper 
+
+        # self.model.eval()
+        # self.likelihood.eval()
+        domain = self.domain
+
+        mu, sigma = self.model.predict(x, return_std=True, return_tensor=True)
+        sigma = torch.sqrt(sigma)
+        ucb = mu + self.beta * sigma
+        # ucb = mu + self.beta * torch.sqrt(sigma)
+        amaxucb = x[np.argmax(ucb.clone().detach().numpy())][np.newaxis, :]
+        self.amaxucb = amaxucb
+        # x = np.vstack([amaxucb for _ in range(self.n_workers)])
+        init_x = np.random.normal(amaxucb, 1.0, (self.n_workers, self.domain.shape[0]))
+
+        x = torch.tensor(init_x, requires_grad=True,dtype=torch.float32)
+        # print("INITIAL x diffable", x.grad)
+        optimizer = torch.optim.Adam([x], lr=0.01)
+        # training_iter = 200
+        training_iter = 200
+        best_loss = 1e6
+        best_x = copy.deepcopy(x)
+        for i in range(training_iter):
+            # if i % 50 == 0:
+            #     print("I am", i)
+            #     print("x at iter %d: " %i, x)
+            optimizer.zero_grad()
+            joint_x = torch.vstack((x,torch.tensor(amaxucb).float()))
+            # joint_x = joint_x.float()
+            # x = x.float()
+            cov_x_xucb = self.model.predict(joint_x, return_cov=True, return_tensor=True)[1][-1, :-1].reshape([-1,1])
+            cov_x_x = self.model.predict(x, return_cov=True, return_tensor=True)[1]
+            if self.diversity_penalty:
+                penalty = []
+                for i in itertools.combinations(range(self.n_workers - 1), 2):
+                    penalty.append(torch.clip(- 1./100. * torch.log(torch.norm(x[i[0]] - x[i[1]]) - self.radius), 0., torch.inf))
+                loss = -torch.matmul(torch.matmul(cov_x_xucb.T, torch.linalg.inv(cov_x_x + 0.01 * torch.eye(len(cov_x_x)))), cov_x_xucb) + sum(penalty)
+            else:
+                loss = -torch.matmul(
+                    torch.matmul(cov_x_xucb.T, torch.linalg.inv(cov_x_x + 0.01 * torch.eye(len(cov_x_x)))), cov_x_xucb)
+            # print("loss at iter %d" %i, loss)
+            loss.backward()
+            # print("x grad at %d" %i, x.grad)
+            optimizer.step()
+            # print("x grad at %d after step" %i, x.grad)
+            # # project back to domain
+            # x = torch.where(x > torch.tensor(domain[:, 1]), torch.tensor(domain[:, 1]), x)
+            # x = torch.where(x < torch.tensor(domain[:, 0]), torch.tensor(domain[:, 0]), x)
+            # x.detach_()
+
+            # project back to domain
+            if torch.all(x == torch.clamp(x, torch.tensor(self.domain[:,0]),torch.tensor(self.domain[:, 1]))) == False:
+                # print("x_opt for alg %d" %k, x_opt)
+                x = torch.clamp(x, torch.tensor(self.domain[:, 0]),torch.tensor(self.domain[:,1]))
+                x = torch.tensor(x, requires_grad=True,dtype=torch.float32)
+                optimizer = torch.optim.Adam([x], lr=0.01)
+                optimizer.zero_grad()
+                # print("im here, projection happend: ", loss)
+                # print("im here", n,i)
+            else:
+                pass
+                # # print("x requires grad iter %d" %i, x.requires_grad)
+                # # x.detach_() #remove detach
+                # # print("x requires grad iter %d after detach" %i, x.requires_grad)
+                # if loss < best_loss:
+                #     best_x = x
+                #     best_loss = loss.detach_()
+                # #     print("im here, loss is: ", loss)
+                # #     print("best loss is (iter %d" %i, best_loss)
+                # #     print("x requires grad iter %d after best_x" %i, x.requires_grad)
+                # # print("no projection, loss here: ", loss)
+        return x.clone().detach().numpy()
+
+    def _entropy_search_grad_with_issues(self, a, x, n, radius=0.1):
+        """
+                Entropy search acquisition function.
+                Args:
+                    a: # agents
+                    x: array-like, shape = [n_samples, n_hyperparams]
+                    n: agent nums
+                    projection: if project to a close circle
+                    radius: circle of the projected circle
+                """
+
+        x = x.reshape(-1, self._dim)
+        # self.beta = 1. + 0.2 * n
+        self.beta = 3 - 0.019 * n
+
+        # self.model.eval()
+        # self.likelihood.eval()
+        domain = self.domain
+
+        mu, sigma = self.model.predict(x, return_std=True, return_tensor=True)
+        ucb = mu + self.beta * sigma
+        # ucb = mu + self.beta * torch.sqrt(sigma) #try this?
+        amaxucb = x[np.argmax(ucb.clone().detach().numpy())][np.newaxis, :]
+        self.amaxucb = amaxucb
+        # x = np.vstack([amaxucb for _ in range(self.n_workers)])
+        # init_x = np.random.normal(amaxucb, 1.0, (self.n_workers, self.domain.shape[0]))
+        init_x = np.random.normal(amaxucb, 1.0, (self.n_workers, self.domain.shape[0]))
+        # init_x = init_x.float()
+
+        x = torch.tensor(init_x, requires_grad=True,dtype=torch.float32)
+        # x = torch.tensor(init_x, requires_grad=True)
+        optimizer = torch.optim.Adam([x], lr=0.01)
+        # optimizer = torch.optim.SGD([x], lr=0.01)
+        training_iter = 200
+        # training_iter = 2
+        for i in range(training_iter):
+            if i % 50 == 0:
+                print("I am", i)
+                print("x at iter %d: " %i, x)
+            # x = torch.tensor(x, requires_grad=True,dtype=torch.float32)
+            # optimizer = torch.optim.Adam([x], lr=0.01)
+            # optimizer = torch.optim.SGD([x], lr=0.01)
+            # print("x at inner iter %d" %i, x)
+            optimizer.zero_grad()
+            joint_x = torch.vstack((x,torch.tensor(amaxucb).float()))
+            # joint_x = joint_x.float()
+            # x = x.float()
+            cov_x_xucb = self.model.predict(joint_x, return_cov=True, return_tensor=True)[1][-1, :-1].reshape([-1,1])
+            cov_x_x = self.model.predict(x, return_cov=True, return_tensor=True)[1]
+            if self.diversity_penalty:
+                penalty = []
+                for i in itertools.combinations(range(self.n_workers - 1), 2):
+                    penalty.append(torch.clip(-1./100. * torch.log(torch.norm(x[i[0]] - x[i[1]]) - self.radius), 0., torch.inf))
+                loss = -torch.matmul(torch.matmul(cov_x_xucb.T, torch.linalg.inv(cov_x_x + 0.01 * torch.eye(len(cov_x_x)))), cov_x_xucb) + sum(penalty)
+            else:
+                loss = -torch.matmul(
+                    torch.matmul(cov_x_xucb.T, torch.linalg.inv(cov_x_x + 0.01 * torch.eye(len(cov_x_x)))), cov_x_xucb)
+            # print("loss at inner iter %d" %i, loss)
+            loss.backward()
+            # print("loss grad times lr at %d" %i, x.grad * 0.01)
+            # print("before step", x)
+            optimizer.step()
+            # print("is leaf", x.is_leaf)
+            # print("after step", x)
+            # project back to domain
+            x = torch.where(x > torch.tensor(domain[:, 1]), torch.tensor(domain[:, 1]), x)
+            x = torch.where(x < torch.tensor(domain[:, 0]), torch.tensor(domain[:, 0]), x)
+            # print("after project", x)
+            # print("loss grad at %d, after project" %i, x.grad)
+            x.detach_()
+        return x.clone().detach().numpy()
+
+
+
+    #try new_variant where TS changes at each iter
+    def _TS_RSR(self, a, x, n, radius=0.1,n_random = 1000,n_restarts = -1):
+        #trying out n_samples = 1 for now
+        """
+                TS-UCB-seq
+                Args:
+                    a: # agents
+                    x: array-like, shape = [n_samples, n_hyperparams]
+                    n: agent nums
+                    projection: if project to a close circle
+                    radius: circle of the projected circle
+                """
+
+        x = x.reshape(-1, self._dim)
+        queries = []
+        Y_max = np.max(self.model.y_train_)
+        l = 0
+        eps = 1e-4
+        while True: #this is to catch the bug in bird (but doesn't work yet)
+            try:
+                # print("before samplimg")
+                # print("x.shape")
+                samples = self.model.sample_y(x, n_samples = self.n_ysamples * self.n_workers)
+                # print("after sampling")
+            except:
+                # l += 1
+                # self.model.likelihood.noise += eps
+                # print("samples failed for the %d-th time, new likelihood noise: " %l, self.model.likelihood.noise)
+                print("alg threw up an error at sampling at iter %d" %n)
+                return np.random.uniform(self.domain[:,0], self.domain[:,1], (self.n_workers, self.domain.shape[0]))
+            else: #if no exception
+                break
+        mu, sigma = self.model.predict(x,return_std=True)
+        max_mu_in_x = np.max(mu)
+
+
+
+        fstar_hat = np.zeros(self.n_workers)
+        for j in np.arange(self.n_workers):
+            for i in range(self.n_ysamples):
+                fstar_hat[j] += np.max(samples[:, j*self.n_ysamples + i])
+            fstar_hat[j] /= self.n_ysamples
+
+
+
+        mu,sigma = self.model.predict(x,return_std=True)
+        max_mu = np.max(mu)
+        min_sigma = np.sqrt(np.min(sigma))
+        max_sigma = np.sqrt(np.max(sigma))
+        # print("min sigma across x iter %d" %(n),min_sigma)
+        # print("max sigma across x iter %d" %(n),max_sigma)
+        sigma_of_max_mu = np.sqrt(sigma[np.argmax(mu)])
+        # print("sigma of max mu", sigma_of_max_mu)
+        # print("Ymax now", Y_max)
+
+        mu_max_x = np.max(mu)
+        sigma_max_x = np.sqrt(sigma[np.argmax(mu)])
+        y_target = np.empty(self.n_workers)
+        for i in range(self.n_workers):
+            if fstar_hat[i] < mu_max_x:
+                while True:
+                    # y = np.random.normal(mu_max_x, sigma_max_x)
+                    samples = self.model.sample_y(x, n_samples = 1)
+                    y = np.max(samples)
+                    if y > mu_max_x:
+                        y_target[i] = y
+                        break
+                fstar_hat[i] = y_target[i]
+            # print("y target agent %d, iter %d" % (i,n), fstar_hat[i])
+        fstar_hat = np.maximum(fstar_hat, y_target) #try this to see what happens
+        # print("fstar_hat - max_mu, iter %d " %( n), fstar_hat - max_mu)
+        # print("fstar_hat - Y_max, iter %d " %( n), fstar_hat - Y_max)
+        # print("min sigma %d" %n, min_sigma)
+        fantasized_X = self.X.copy()
+        fantasized_Y = self.Y.copy()
+        # ts_ucb = (fstar_hat - mu)/np.sqrt(sigma)
+        ts_ucb = (fstar_hat[0] - mu)/np.sqrt(sigma)
+        query = x[np.argmin(ts_ucb)]
+        # print("x shape here", x.shape)
+        # fantasized_y = self.model.predict(query)[0]
+        fantasized_y = 0.
+        queries.append(query)
+        for i in range(self.n_workers- 1):
+            fantasized_X.append(query)
+            fantasized_Y.append(fantasized_y)
+            fantastic_model = copy.deepcopy(self.model) #take care to separate fantasy model from self.model
+            fantastic_model.fit(np.array(fantasized_X),np.array(fantasized_Y))
+            try:
+                _,sigma = fantastic_model.predict(x,return_std=True)
+                # print("x dtype", x.dtype)
+                # print("sigma shape here", sigma.shape)
+                _,sigma_last = fantastic_model.predict(x[np.argmin(ts_ucb)],return_std=True)
+                _,sigma_0 = fantastic_model.predict(np.asarray([self.X[0]]),return_std=True)
+                # print("sigma last: ", np.sqrt(sigma_last))
+                # print("sigma 0: ", np.sqrt(sigma_0))
+            except:
+                print("somehow failed")
+                pass #use old sigma in this case.
+
+            ts_ucb = (fstar_hat[i+1] - mu)/np.sqrt(sigma)
+
+
+            init_x = copy.deepcopy(x[np.argmin(ts_ucb)])
+            # init_x = np.random.normal(x[np.argmin(ts_ucb)], 0.2)
+            x0 = torch.tensor(init_x, requires_grad=True,dtype=torch.float32)
+            # x0 = x0.float()
+            optimizer = torch.optim.Adam([x0], lr=0.01)
+            optimizer.zero_grad()
+            best_loss = torch.tensor(ts_ucb[np.argmin(ts_ucb)])
+            best_x = torch.tensor(x[np.argmin(ts_ucb)])
+            # iters = 10
+            iters = 10
+            # iters =0 
+            # if self.objective_name == 'bird': #bird covariance sometimes gets too small, see if this fixes things
+            #     iters = 1
+            for k in np.arange(iters):
+                optimizer.zero_grad()
+                mu_x= self.model.predict(x0,return_tensor=True)
+                joint_x = torch.vstack((torch.tensor(queries).float(),x0))
+                _, cov_x_x = self.model.predict(joint_x, return_cov = True, return_tensor = True)
+                # print("I am here iter %d" %n)
+                # print("cov_x0 at opt iter %d, agent %d, iter %d" %(k,i,n), cov_x_x[-1,-1])
+                cov_x0_updated = cov_x_x[-1,-1] - torch.matmul(
+                            torch.matmul(cov_x_x[-1,:-1], torch.linalg.inv(cov_x_x[:-1,:-1] + 1e-6 * torch.eye(len(cov_x_x[:-1,:-1])))), 
+                            cov_x_x[-1,:-1].T)
+                # print("cov_x0 updated at opt iter %d, agent %d, iter %d" %(k,i,n), cov_x0_updated)
+                # print("(after) I am here iter %d" %n) #NO PROBLEM WITH THIS CODE
+                # loss = (fstar_hat - mu_x)/torch.sqrt(cov_x0_updated) #TRY THIS NEW VERSION
+                # print("cov_x0_updated value (iter %d), inner iter: %d" %(n,k), cov_x0_updated)
+                try:
+                    loss = (fstar_hat[i+1] - mu_x)/torch.sqrt(cov_x0_updated) #TRY THIS NEW VERSION
+                    # print("loss updated at opt iter %d, agent %d, iter %d" %(k,i,n), loss)
+                    # print("loss num updated at opt iter %d, agent %d, iter %d" %(k,i,n), (fstar_hat[i+1] - mu_x))
+                except:
+                    # print("cov_x0_updated value (actual value:%.6f) is probably nan (iter %d), inner iter: %d, just break" %(cov_x0_updated, n,k))
+                    break
+                # print("this is loss, x0, mu_x, sigma_x", loss, x0, mu_x,torch.sqrt(cov_x0_updated))
+                # print("avg mu_x", np.mean(mu))
+                loss.backward()
+                # print("x0 grad at iter %d" %k, x0.grad)
+                optimizer.step()
+                # print("loss at opt iter %d, agent %d, iter %d" %(k,i,n), loss)
+                # print("x0 at opt iter %d, agent %d, iter %d" %(k,i,n), x0)
+                # project back to domain
+                if  torch.all(x0 == torch.clamp(x0, torch.tensor(self.domain[:,0]),torch.tensor(self.domain[:, 1]))) == False:
+                    # print("x_opt for alg %d" %k, x_opt)
+                    x0 = torch.clamp(x0, torch.tensor(self.domain[:, 0]),torch.tensor(self.domain[:,1]))
+                    x0 = torch.tensor(x0, requires_grad=True,dtype=torch.float32)
+                    optimizer = torch.optim.Adam([x0], lr=0.01)
+                    optimizer.zero_grad()
+                    # print("im here", n,i)
+                else:
+                    if loss < best_loss and loss > 0:
+                        best_loss = loss.clone().detach()
+                        best_x = x0.detach().clone()
+                    # # print("x0 requires grad iter %d" %k, x0.requires_grad)
+                    # # x0.detach_()
+                    # # print("x0 requires grad iter %d" %k, x0.requires_grad)
+                    # if loss < best_loss and loss > 0:
+                    #     best_x = x0.detach().clone() #please be careful with assignment, assignment or shallow copy will be bad!!
+                    #     best_loss = loss.detach()
+                    # elif loss < best_loss and loss < 0:
+                    #     print("IM HERE (iter %d)" %n)
+                    # elif loss < 0: #retry (but within the budget of 10 total gradient steps)
+                    #     init_x = np.random.normal(x[np.argmin(ts_ucb)], 0.2)
+ #     x0 = torch.tensor(init_x, requires_grad=True,dtype=torch.float32)
+                    #     # x0 = x0.float()
+                    #     optimizer = torch.optim.Adam([x0], lr=0.01)
+                    #     optimizer.zero_grad()
+                    #     print("best_x and x0 same (by way of difference)? (shouldn't be)", best_x- x0)
+
+            mu_x0, sigma_x0  = self.model.predict(x0.clone().detach(), return_std = True)
+            sigma_x0 = np.sqrt(sigma_x0)
+            loss_x0 = (fstar_hat[i+1] - mu_x0)/sigma_x0 #note the (i+1)!
+            # print("best loss is (agent %i), iter %d:" %(i,n), best_loss)
+            # print("loss_x0 is (agent %i), iter %d:" %(i,n), loss_x0)
+            # print("fstar_hat[%d+1] is" %i, fstar_hat[i+1] )
+            # mu_x_opt, sigma_x_opt  = self.model.predict(np.asarray([-1.,-1.]), return_std = True)
+            # print("mu_opt is ", mu_x_opt)
+            # print("sigma_x_opt is", np.sqrt(sigma_x_opt))
+            # print("loss_opt is", (fstar_hat[i+1] - mu_x_opt)/np.sqrt(sigma_x_opt))
+            # print("mu_x0 is  ", mu_x0)
+            # print("sigma_x0 is ", sigma_x0)
+            # print("initial x0 is", x[np.argmin(ts_ucb)])
+            # print("initial mu_x is(agent %i), iter %d:" %(i,n), mu[np.argmin(ts_ucb)])
+            # print("initial sigma_x is(agent %i), iter %d:" %(i,n), np.sqrt(sigma[np.argmin(ts_ucb)]))
+
+            query = best_x.clone().detach().numpy()
+            # if loss_x0 < best_loss:
+            #     # print("initial loss (agent %d, iter %d)" %(i,n), best_loss)
+            #     query = x0.clone().detach().numpy()
+            #     # print("loss now (agent %d, iter %d)" %(i,n), loss)
+            # else:
+            #     query = x[np.argmin(ts_ucb)]
+                # print("best_loss still best after GD: agent %d, iter %d" %(i,n))
+                # print("would have been x0", x0.clone().detach().numpy())
+                # print("actual x0", query)
+            # print("this is query (agent %d), iter %d" %(i,n), query)
+            # query = x0.clone().detach().numpy()
+            # print("x0 after update is(agent %i), iter %d:" %(i,n), query)
+            # print("mu_x after update is(agent %i), iter %d:" %(i,n), mu_x0)
+            # print("sigma_x after update is (agent %i), iter %d:" %(i,n), sigma_x0)
+
+            # if loss_x0 < best_loss and loss_x0 > 0:
+            #     query = x0.clone().detach().numpy()
+            # else: 
+            #     print("setting query to be argmin ts_ucb")
+            #     query =  x[np.argmin(ts_ucb)]
+
+            # best_x.detach() #does this do anything?
+            # query = best_x.clone().detach().numpy()
+            # print("loss of min_ts_ucb", ts_ucb[np.argmin(ts_ucb)])
+            # print("best loss for agent %d at iter %d" %(i,n), best_loss)
+            mu_best_x, sigma_x = self.model.predict(query, return_std = True)
+            sigma_x = np.sqrt(sigma_x)
+            # print("fsar_hat[i+1]agent %d at iter %d" %(i,n), fstar_hat[i])
+            # print("fsar_hat - best_x for agent %d at iter %d" %(i,n), fstar_hat[i] - mu_best_x)
+            # print("sigma_x for agent %d at iter %d" %(i,n), sigma_x)
+            # print(" loss for agent %d at iter %d after training" %(i,n), (fstar_hat[i] - mu_best_x)/sigma_x)
+            # print("query at iter %d, worker %d: " %(n,i), query)
+            # print("query dtytpe", query.dtype)
+            # print("true objextive at argmin ts_ucb", self.objective(query))
+            if np.isnan(query[0]): #this happens quite rarely.
+                print("had to do random query")
+                query = np.random.normal(x[np.argmin(ts_ucb)], 1e-2) #just an arbitrary small neighborhood around the actual argmin
+            queries.append(query)
+            # mu_x, cov_x_x = fantastic_model.predict(x0, return_cov =True, return_tensor=False)
+            # print(" (after optimizing) min ts_ucb, outer iter %d" % (n), best_loss)
+            # print("sigma of min ts_ucb,outer iter %d " %(n), np.sqrt(cov_x_x))
+            # print("num of min ts_ucb, outer iter %d" % (n), (fstar_hat - mu_x))
+            # print("x of min ts_ucb, outer iter %d" % (n), query)
+        return np.array(queries)
+
+
+
+
+
+    def _TS_UCB_seq_1_f(self, a, x, n, radius=0.1,n_random = 200, n_samples = 1, n_restarts = 300):
+        """
+                TS-UCB-seq
+                Args:
+                    a: # agents
+                    x: array-like, shape = [n_samples, n_hyperparams]
+                    n: agent nums
+                    projection: if project to a close circle
+                    radius: circle of the projected circle
+                """
+
+        x = x.reshape(-1, self._dim)
+        queries = []
+        # Y_max = np.max(self.model.y_train_)
+        # n_random *= max(int(self.n_workers/10),1) 
+        n_random *= max(int(self.n_workers/10),1) * 5 #testing for now
+        x_random = np.random.uniform(self.domain[:,0], self.domain[:,1], (n_random, self.domain.shape[0]))
+        x_random = x_random.reshape(-1,self._dim)
+        samples = self.model.sample_y(x_random, n_samples=n_samples)
+        # print(samples.shape, "shape samples")
+        fstar_hat = 0.0
+        for i in range(n_samples):
+            fstar_hat += np.max(samples[:,i])
+        fstar_hat /= n_samples
+        # print("f star hat", fstar_hat)
+        # print("Y_max", Y_max)
+
+
+
+        mu,sigma = self.model.predict(x,return_std=True)
+        fantasized_X = self.X.copy()
+        fantasized_Y = self.Y.copy()
+        ts_ucb = (fstar_hat - mu)/np.sqrt(sigma)
+        fantasized_y = 0.
+        query = x[np.argmin(ts_ucb)]
+        queries.append(query)
+        # print("mu at ts usb argmin", mu[np.argmin(ts_ucb)])
+        # print("sigma at ts_ucb argmin", np.sqrt(sigma[np.argmin(ts_ucb)]))
+        for i in range(self.n_workers- 1):
+            fantasized_X.append(query)
+            fantasized_Y.append(fantasized_y)
+            self.model.fit(np.array(fantasized_X),np.array(fantasized_Y))
+            _,sigma = self.model.predict(x,return_std=True)
+            ts_ucb = (fstar_hat - mu)/np.sqrt(sigma)
+            # print(fstar_hat,
+            #         np.max(mu),
+            #         sigma[np.argmin(ts_ucb)],
+            #     "min ts_ucb numerator fstar_hat, mu and denominator std")
+            query = x[np.argmin(ts_ucb)]
+            queries.append(query)
+        return np.array(queries)
+
+
+
+
+
+    def _batch_upper_confidential_bound(self, a, x, n):
+        """
+        Entropy search acquisition function.
+        Args:
+            a: # agents
+            x: array-like, shape = [n_samples, n_hyperparams]
+            model:
+        """
+
+        x = x.reshape(-1, self._dim)
+        queries = []
+
+        model = self.model
+
+        # if self.beta is None:
+        #     self.beta = 2.
+        # self.beta = 1. + 0.01 * n
+        # self.beta = 3 - 0.019 * n
+        delta = 0.01
+        self.beta = 0.1 * 2. * np.log(x.shape[0] * n**2 * np.pi**2/(6. * delta)) #compare to the Desaultels paper 
+        # self.beta = 0.15 + 0.019 * n
+
+        mu, sigma = model.predict(x, return_std=True)
+        fantasized_X = self.X.copy()
+        fantasized_Y = self.Y.copy()
+        # ucb = mu + self.beta * sigma
+        ucb = mu + self.beta * np.sqrt(sigma)
+        amaxucb = x[np.argmax(ucb)]
+        fantasized_y = 0.  # fantasized y will not affect sigma
+        query = amaxucb
+        queries.append(query)
+        self.amaxucb = amaxucb[np.newaxis, :]
+
+        # print("GP noise iter %d" %n, self.model.likelihood.noise)
+        # print("sigma of bucb, iter %d" %n, np.sqrt(sigma[np.argmax(ucb)]))
+        for i in range(self.n_workers - 1):
+            fantasized_X.append(query)
+            fantasized_Y.append(fantasized_y)
+            model.fit(np.array(fantasized_X), np.array(fantasized_Y))
+            _,sigma_bucb = self.model.predict(amaxucb, return_std = True)
+            # print("self.model predict bucb, iter %d (agent %d)" %(n,i), np.sqrt(sigma_bucb))
+            _, sigma = model.predict(x, return_std=True)
+            if self.acq_name == 'bucb':
+                # ucb = mu + self.beta * sigma
+                ucb = mu + self.beta * np.sqrt(sigma)
+                # init_x = np.random.normal(x[np.argmax(ucb)], 0.2)
+                init_x = copy.deepcopy(ucb)
+                x0 = torch.tensor(init_x, requires_grad=True,dtype=torch.float32)
+                optimizer = torch.optim.Adam([x0], lr=0.01)
+                optimizer.zero_grad()
+                best_loss = -np.max(ucb)
+                best_x = torch.tensor(x[np.argmax(ucb)])
+                # iters = 10
+                iters = 0
+                for k in np.arange(iters):
+                    optimizer.zero_grad()
+                    mu_x, sigma_x = self.model.predict(x0, return_std = True, return_tensor = True)
+                    # loss = -(mu_x + self.beta * sigma_x)
+                    loss = -(mu_x + self.beta * torch.sqrt(sigma_x))
+                    loss.backward()
+                    optimizer.step()
+                    if torch.all(x0 == torch.clamp(x0, torch.tensor(self.domain[:,0]),torch.tensor(self.domain[:, 1]))) == False:
+                        # print("x_opt for alg %d" %k, x_opt)
+                        x0 = torch.clamp(x0, torch.tensor(self.domain[:, 0]),torch.tensor(self.domain[:,1]))
+                        x0 = torch.tensor(x0, requires_grad=True,dtype=torch.float32)
+                        optimizer = torch.optim.Adam([x0], lr=0.01)
+                        optimizer.zero_grad()
+                        # print("im here", n,i)
+                    else:
+                        # print("x0 requires grad iter %d" %k, x0.requires_grad)
+                        # x0.detach_()
+                        # print("x0 requires grad iter %d" %k, x0.requires_grad)
+                        if loss < best_loss:
+                            best_x = x0
+                            best_loss = loss.detach_()
+                query = best_x.clone().detach().numpy()
+                queries.append(query)
+            elif self.acq_name == 'ucbpe':
+                query = x[np.argmax(sigma)]
+                queries.append(query)
+        # print("queries shape", len(queries))
+        return np.array(queries)
+
+
+
+
+    def _batch_ucb_no_ucbpe(self, a, x, n):
+        """
+        Entropy search acquisition function.
+        Args:
+            a: # agents
+            x: array-like, shape = [n_samples, n_hyperparams]
+            model:
+        """
+
+        x = x.reshape(-1, self._dim)
+        queries = []
+
+        model = copy.deepcopy(self.model)
+
+        # if self.beta is None:
+        #     self.beta = 2.
+        self.beta = 1. + 0.01 * n
+        # self.beta = 0.15 + 0.019 * n
+
+        mu, sigma = model.predict(x, return_std=True)
+        fantasized_X = self.X.copy()
+        fantasized_Y = self.Y.copy()
+        ucb = mu + self.beta * sigma
+        amaxucb = x[np.argmax(ucb)]
+        fantasized_y = 0.  # fantasized y will not affect sigma
+        query = amaxucb
+        queries.append(query)
+        self.amaxucb = amaxucb[np.newaxis, :]
+
+
+        print("max mu in bucb at %d" %n, np.max(mu))
+        for i in range(self.n_workers - 1):
+            fantasized_X.append(query)
+            fantasized_Y.append(fantasized_y)
+            model.fit(np.array(fantasized_X), np.array(fantasized_Y))
+            _, sigma = model.predict(x, return_std=True)
+            ucb = mu + self.beta * sigma
+            query = x[np.argmax(ucb)]
+            print("query sigma (%d)" %i, sigma[np.argmax(ucb)])
+            print("bucb query %d" % i, query)
+            print("query mu (%d)" %i, mu[np.argmax(ucb)])
+            print("max sigma (%d)" %i, sigma[np.argmax(sigma)])
+            print("mu at max sigma (%d)" %i, mu[np.argmax(sigma)])
+            queries.append(query)
+        return np.array(queries)
+
+
+
+    def _batch_ucbpe(self, a, x, n):
+        """
+        Entropy search acquisition function.
+        Args:
+            a: # agents
+            x: array-like, shape = [n_samples, n_hyperparams]
+            model:
+        """
+
+        x = x.reshape(-1, self._dim)
+        queries = []
+
+        model = copy.deepcopy(self.model)
+
+        # if self.beta is None:
+        #     self.beta = 2.
+        self.beta = 1. + 0.01 * n
+        # self.beta = 0.15 + 0.019 * n
+
+        mu, sigma = model.predict(x, return_std=True)
+        fantasized_X = self.X.copy()
+        fantasized_Y = self.Y.copy()
+        ucb = mu + self.beta * sigma
+        amaxucb = x[np.argmax(ucb)]
+        fantasized_y = 0.  # fantasized y will not affect sigma
+        query = amaxucb
+        queries.append(query)
+        self.amaxucb = amaxucb[np.newaxis, :]
+
+        for i in range(self.n_workers - 1):
+            fantasized_X.append(query)
+            fantasized_Y.append(fantasized_y)
+            model.fit(np.array(fantasized_X), np.array(fantasized_Y))
+            _, sigma = model.predict(x, return_std=True)
+            query = x[np.argmax(sigma)]
+            queries.append(query)
+        return np.array(queries)
+
+
+
+    def _thompson_sampling_centralized(self, a, x, n):
+        x = x.reshape(-1, self._dim)
+        queries = []
+
+        model = copy.deepcopy(self.model)
+
+        samples = model.sample_y(x, n_samples=self.n_workers)
+
+        for i in range(self.n_workers):
+            query = x[np.argmax(samples[:, i])]
+            queries.append(query)
+
+        return np.array(queries)
+
+
+    def _dppts(self, a, x, n, n_MCMC = 2, DPP_lambda = 1.,cutoff_iter  =None,lambda_mode = 'mult',first_ts = False, verbose = False):
+        """
+        dppts based on "Diversified Sampling for Batched Bayesian Optimization with Determinantal Point Processes"
+        Arguments:
+        ----------
+            agent: integer
+                Agent id to find next query for.
+            model: sklearn model
+                Surrogate model used for acquisition function
+            x: array-like, shape = [n_samples, n_hyperparams]
+                The points for which the thompson samples needs to be computed.
+            n_MCMC: #steps of the MCMC algorithm
+            cutoff_iter: number of iterations after which we no longer DPP sample, just exploit with TS
+            DPP_lambda: either a number, or a callable to get lambda a function of t (iter number)
+            lambda_mode: 'mult' if (I + lambda sigma^-2 K), 'pow' if (I + sigma^-2 K)^lambda
+            first_ts boolean: True if the first sample of the batch is sampled with regular TS (non-DPP, i.e. DPPTS-alt in the paper where it was proposed)
+        """
+
+        # first generate initial batch, and obtain its determinant
+        x = x.reshape(-1, self._dim)
+        queries = []
+
+        model = copy.deepcopy(self.model)
+
+        samples = model.sample_y(x, n_samples=self.n_workers)
+        # print("samples shape", samples.shape)
+
+        for i in range(self.n_workers):
+            query = x[np.argmax(samples[:, i])]
+            queries.append(query)
+
+        x_batch = np.array(queries)
+
+        _, post_K_S = model.predict(x_batch, return_cov =True)
+
+        noise_std = np.sqrt(model.model.likelihood.noise.detach().numpy()) 
+        # print("this is noise std", noise_std)
+        if lambda_mode == 'mult':
+            K_S = np.eye(self.n_workers) + DPP_lambda * (noise_std ** -2) * post_K_S
+            det_K_S = np.linalg.det(K_S)
+        elif lambda_mode == 'pow':
+            K_S = np.eye(self.n_workers) + (noise_std ** -2) * post_K_S
+            det_K_S = np.linalg.det(K_S) ** DPP_lambda
+        else:
+            raise ValueError("Unsupported lambda_mode")
+
+        # #start temp saving the sampled pmax (if needed for some metrics)
+        # temp_pmax_samples = x_batch
+
+        if cutoff_iter is None:
+            steps = 0
+            while n_MCMC > 0:
+                switch_i = np.random.randint(0 if not first_ts else 1, self.n_workers) #If first was sampled with regular TS, cannot swap it during MCMC
+                new_samples = model.sample_y(x, n_samples = 1)[:,0] #sample_y returns a  batch_size x n_samples array, so we just take the first and only column
+                xnext = x[np.argmax(new_samples)]
+                x_batch_prop = copy.deepcopy(x_batch)
+                # x_batch_prop[switch_i] = torch.t(xnext.view(-1,1))
+                x_batch_prop[switch_i,:] = xnext
+                (_,post_K_S) = model.predict(x_batch_prop, return_cov =True)
+                if lambda_mode == 'mult':
+                    K_S = np.eye(self.n_workers) + DPP_lambda * (noise_std ** -2) * post_K_S
+                    det_K_S_prop = np.linalg.det(K_S)
+                elif lambda_mode == 'pow':
+                    K_S = np.eye(self.n_workers) + (noise_std ** -2) * post_K_S
+                    det_K_S_prop = np.linalg.det(K_S) ** DPP_lambda
+                else:
+                    raise ValueError("Unsupported lambda_mode")
+                alpha = np.minimum(1., det_K_S_prop / det_K_S)
+                if torch.rand(1) < alpha:
+                    x_batch = x_batch_prop
+                    det_K_S = det_K_S_prop
+                    # print("accepted after %d steps" %steps)
+                    if verbose==True:
+                        print("Accepted with probability {}".format(alpha.numpy()))
+                else:
+                    if verbose==True:
+                        print("Rejected with probability {}".format(alpha.numpy()))
+                # log_lik = torch.log(det_K_S)
+                # log_lik_hist = torch.cat((log_lik_hist, log_lik.view(1,1)), dim=0)
+                # self.temp_pmax_samples = torch.cat((self.temp_pmax_samples, xnext.view(1,-1)), dim=0)
+                n_MCMC -= 1
+                steps += 1
+
+
+        # return np.array(queries)
+        return x_batch
+
+    def _stochastic_policy_centralized(self, a, x, n):
+        x = x.reshape(-1, self._dim)
+        # print("x shape", x.shape,a,n)
+        model = copy.deepcopy(self.model)
+        acq = model.predict(x)
+        # for i in range(self.n_workers):
+        #     queries.append(self._boltzmann(n, x, acq))
+        C = max(abs(max(acq) - acq))
+        if C > 10 ** (-2):
+            beta = 3 * np.log(n + self._initial_data_size + 1) / C
+            _blotzmann_prob = lambda e: np.exp(beta * e)
+            bm = [_blotzmann_prob(e) for e in acq]
+            norm_bm = [float(i) / sum(bm) for i in bm]
+            idxes = np.random.choice(range(x.shape[0]), p=np.squeeze(norm_bm), size=(self.n_workers,))
+        else:
+            idxes = np.random.choice(range(x.shape[0]), size=(self.n_workers,))
+        queries = [x[idx] for idx in idxes]
+
+        return np.array(queries)
+
+
+    def _stochastic_policy_EI(self, a, x, n):
+        x = x.reshape(-1, self._dim)
+        # print("x shape", x.shape,a,n)
+        model = copy.deepcopy(self.model)
+        mu, sigma = model.predict(x, return_std=True)
+        sigma = np.sqrt(sigma) #correct for syntax err in code
+        fantasized_X = self.X.copy()
+        fantasized_Y = self.Y.copy()
+        Y_max = np.max(model.y_train_)
+        with np.errstate(divide='ignore'):
+            Z = (mu - Y_max) / sigma
+            expected_improvement = (mu - Y_max) * norm.cdf(Z) + sigma * norm.pdf(Z)
+            expected_improvement[sigma == 0.0] = 0
+            expected_improvement[expected_improvement < 10 ** (-100)] = 0
+        acq = expected_improvement
+        # for i in range(self.n_workers):
+        #     queries.append(self._boltzmann(n, x, acq))
+        C = max(abs(max(acq) - acq))
+        if C > 10 ** (-2):
+            beta = 3 * np.log(n + self._initial_data_size + 1) / C
+            _blotzmann_prob = lambda e: np.exp(beta * e)
+            bm = [_blotzmann_prob(e) for e in acq]
+            norm_bm = [float(i) / sum(bm) for i in bm]
+            idxes = np.random.choice(range(x.shape[0]), p=np.squeeze(norm_bm), size=(self.n_workers,))
+        else:
+            idxes = np.random.choice(range(x.shape[0]), size=(self.n_workers,))
+        queries = [x[idx] for idx in idxes]
+
+        return np.array(queries)
+
+    def _qEI(self, a, x, n, n_tries = 400, n_MC = 10):
+        x = x.reshape(-1, self._dim)
+        model = copy.deepcopy(self.model)
+        # x_random = np.random.uniform(self.domain[:,0], self.domain[:,1], (n_random, self.n_workers, self.domain.shape[0]))
+        # x_random = x_random.reshape(-1,self.n_workers,self._dim)
+        # model.sample_y(x_random, n_samples=self.n_ysamples)
+        Y_max = np.max(self.model.y_train_)
+        best_avg_gain = -1
+        queries = None
+        for i in range(n_tries):
+            x_batch = np.random.uniform(self.domain[:,0], self.domain[:,1], (self.n_workers, self.domain.shape[0]))
+            y_samples = self.model.sample_y(x_batch, n_samples=n_MC)
+            avg_gain = np.mean(np.maximum(np.max(y_samples, axis = 0) - Y_max,0))
+            if avg_gain > best_avg_gain:
+                best_avg_gain = avg_gain
+                queries = x_batch
+        return queries
+
+
+
+    def _expected_improvement_fantasized(self, a, x, n):
+
+
+        x = x.reshape(-1, self._dim)
+        queries = []
+
+        model = self.model
+
+        # if self.beta is None:
+        #     self.beta = 2.
+        # self.beta = 3. + 0.19 * n
+        mu, sigma = model.predict(x, return_std=True)
+        sigma = np.sqrt(sigma) #correct for syntax err in code
+        fantasized_X = self.X.copy()
+        fantasized_Y = self.Y.copy()
+
+        Y_max = np.max(model.y_train_)
+        with np.errstate(divide='ignore'):
+            Z = (mu - Y_max) / sigma
+            expected_improvement = (mu - Y_max) * norm.cdf(Z) + sigma * norm.pdf(Z)
+            expected_improvement[sigma == 0.0] = 0
+            expected_improvement[expected_improvement < 10 ** (-100)] = 0
+        query = x[np.argmax(expected_improvement)]
+        queries.append(query)
+        fantasized_y = float(model.predict(query))
+
+        for i in range(self.n_workers - 1):
+            fantasized_X.append(query)
+            fantasized_Y.append(fantasized_y)
+            model.fit(np.array(fantasized_X), np.array(fantasized_Y))
+            try: #fix a numerical issue
+                mu, sigma = model.predict(x, return_std=True)
+            except: #duplicate query if run into numerical issue
+                queries.append(query)
+            sigma = np.sqrt(sigma)
+            with np.errstate(divide='ignore'):
+                Z = (mu - Y_max) / sigma
+                expected_improvement = (mu - Y_max) * norm.cdf(Z) + sigma * norm.pdf(Z)
+                expected_improvement[sigma == 0.0] = 0
+                expected_improvement[expected_improvement < 10 ** (-100)] = 0
+
+            # init_x = np.random.normal(x[np.argmax(expected_improvement)], 0.2)
+            init_x = copy.deepcopy(x[np.argmax(expected_improvement)])
+            x0 = torch.tensor(init_x, requires_grad=True,dtype=torch.float32)
+            optimizer = torch.optim.Adam([x0], lr=0.01)
+            optimizer.zero_grad()
+            best_loss = -np.max(expected_improvement)
+            best_x = torch.tensor(x[np.argmax(expected_improvement)])
+            # iters = 10
+            iters = 0
+            for k in np.arange(iters):
+                optimizer.zero_grad()
+                try:
+                    mu_x, sigma_x = self.model.predict(x0, return_std = True, return_tensor = True)
+                except:
+                    continue
+                sigma_x = torch.sqrt(sigma_x) #take sqrt!!
+                # loss = -(mu_x + self.beta * sigma_x)
+                Z_x = (mu_x - Y_max) / sigma_x
+                normal_dist = torch.distributions.normal.Normal(loc = 0, scale = 1)
+                loss = -((mu_x - Y_max) * normal_dist.cdf(Z_x) + sigma_x * torch.exp(normal_dist.log_prob(Z_x)))
+                loss.backward()
+                optimizer.step()
+                if torch.all(x0 == torch.clamp(x0, torch.tensor(self.domain[:,0]),torch.tensor(self.domain[:, 1]))) == False:
+                    # print("x_opt for alg %d" %k, x_opt)
+                    x0 = torch.clamp(x0, torch.tensor(self.domain[:, 0]),torch.tensor(self.domain[:,1]))
+                    x0 = torch.tensor(x0, requires_grad=True,dtype=torch.float32)
+                    optimizer = torch.optim.Adam([x0], lr=0.01)
+                    optimizer.zero_grad()
+                    # print("im here", n,i)
+                else:
+                    # print("x0 requires grad iter %d" %k, x0.requires_grad)
+                    # x0.detach_()
+                    # print("x0 requires grad iter %d" %k, x0.requires_grad)
+                    if loss < best_loss:
+                        best_x = x0
+                        best_loss = loss.detach_()
+            query = best_x.clone().detach().numpy()
+            queries.append(query)                
+            fantasized_y = float(model.predict(query))
+        return np.array(queries)
+
+    def _find_next_query(self, n, a, random_search):
+        """
+        Proposes the next query.
+        Arguments:
+        ----------
+            n: integer
+                Iteration number.
+            agent: integer
+                Agent id to find next query for.
+            model: sklearn model
+                Surrogate model used for acqusition function
+            random_search: integer.
+                Number of random samples used to optimize the acquisition function. Default 1000
+        """
+        # Candidate set
+        # random_search *= max(int(self.n_workers/10),1) #higher for more workers
+        # print("random search num", random_search)
+        # print("random search number", random_search)
+        x = np.random.uniform(self.domain[:, 0], self.domain[:, 1], size=(random_search, self._dim))
+        # print("x shape", x.shape)
+        try:
+            mu = self.model.predict(x)
+        except: #return random query if run into numerical issues
+            return np.random.uniform(self.domain[:, 0], self.domain[:, 1], size=(self.n_workers, self._dim))
+
+        #add in new points to x (potential high mu points)
+
+
+        # first do GD from argmax mu
+
+        x_max_mu = x[np.argmax(mu)]
+        init_x = copy.deepcopy(x_max_mu)
+        x0 = torch.tensor(init_x, requires_grad=True,dtype=torch.float32)
+        optimizer = torch.optim.Adam([x0], lr=1e-3)
+        optimizer.zero_grad()
+        highest_x = torch.tensor(np.max(mu))
+        iters = 200
+        # print("max_mu: n = %d" %n, np.max(mu))
+        for k in np.arange(iters):
+            optimizer.zero_grad()
+            mu_x= self.model.predict(x0,return_tensor=True)
+            try:
+                loss = -mu_x
+            except:
+                print("cov_x0_updated value (actual value:%.6f) is probably nan (iter %d), inner iter: %d, just break" %(cov_x0_updated, n,k))
+                break
+            loss.backward()
+            optimizer.step()
+            # project back to domain
+            if  torch.all(x0 == torch.clamp(x0, torch.tensor(self.domain[:,0]),torch.tensor(self.domain[:, 1]))) == False:
+                x0 = torch.clamp(x0, torch.tensor(self.domain[:, 0]),torch.tensor(self.domain[:,1]))
+                x0 = torch.tensor(x0, requires_grad=True,dtype=torch.float32)
+                optimizer = torch.optim.Adam([x0], lr=1e-4)
+                optimizer.zero_grad()
+            else:
+                pass
+        # print("final mu after running GD from x_max_mu: n = %d" %n, -loss)
+        x = np.vstack((x,x0.detach().clone().numpy()))
+
+
+
+        # next try GD from the points already seen
+
+
+        # Y_max = np.max(self.model.y_train_)
+        x_max = self.model.X_train_[np.argmax(self.model.y_train_)]
+        # print("x_max", x_max)
+        mu_max_x,sigma_max_x = self.model.predict(x_max,return_std=True)
+        # print("actual predicted mu_max_x and sigma_max_x %d" %n, mu_max_x, np.sqrt(sigma_max_x))
+        # print("sigma of max mu", sigma_of_max_mu)
+        # print("Ymax now", Y_max)
+
+        #GD to maximize mu
+        thres = 0.1 #thres for deciding whether we need to add a new point (with high posterior mean) to x 
+        for i in range(self.model.y_train_.size):
+            # print(" I am here (iter %d)" %n, i)
+            x_i = self.model.X_train_[i,:]
+            x_i = np.reshape(x_i,(1,-1))
+            mu_i,sigma_i = self.model.predict(x_i,return_std=True)
+            if mu_i <= np.max(mu):
+                pass 
+            else:
+                # print("x_i - x shape", (x-x_i).shape)
+                # print(x[0,:] - x_i, "hi")
+                dist_i_to_x = np.min(np.linalg.norm( x - x_i, axis = 1))
+                if dist_i_to_x > thres : #only consider adding x_i to x if its distance to x is larger than a thres
+                    # print("starting at: ", mu_i, "x_i: ", x_i, "dist_i", dist_i_to_x)
+                    init_x = copy.deepcopy(x_i)
+                    # init_x = np.random.normal(x[np.argmin(ts_ucb)], 0.2)
+                    x0 = torch.tensor(init_x, requires_grad=True,dtype=torch.float32)
+                    # x0 = x0.float()
+                    # optimizer = torch.optim.Adam([x0], lr=1e-4)
+                    optimizer = torch.optim.Adam([x0], lr=1e-2)
+                    optimizer.zero_grad()
+                    highest_x = torch.tensor(x_max)
+                    # iters = 10
+                    # iters = 10
+                    iters = 200
+                    # iters =0 
+                    # if self.objective_name == 'bird': #bird covariance sometimes gets too small, see if this fixes things
+                    #     iters = 1
+                    for k in np.arange(iters):
+                        optimizer.zero_grad()
+                        mu_x= self.model.predict(x0,return_tensor=True)
+                        try:
+                            loss = -mu_x
+                        except:
+                            print("cov_x0_updated value (actual value:%.6f) is probably nan (iter %d), inner iter: %d, just break" %(cov_x0_updated, n,k))
+                            break
+                        # print("this is loss, x0, mu_x, sigma_x", loss, x0, mu_x,torch.sqrt(cov_x0_updated))
+                        # print("avg mu_x", np.mean(mu))
+                        loss.backward()
+                        # print("x0 grad at iter %d" %k, x0.grad)
+                        optimizer.step()
+                        # print("mu at opt iter %d" % k, loss)
+                        # project back to domain
+                        if  torch.all(x0 == torch.clamp(x0, torch.tensor(self.domain[:,0]),torch.tensor(self.domain[:, 1]))) == False:
+                            # print("x_opt for alg %d" %k, x_opt)
+                            x0 = torch.clamp(x0, torch.tensor(self.domain[:, 0]),torch.tensor(self.domain[:,1]))
+                            x0 = torch.tensor(x0, requires_grad=True,dtype=torch.float32)
+                            optimizer = torch.optim.Adam([x0], lr=1e-4)
+                            optimizer.zero_grad()
+                            # print("im here", n,i)
+                        else:
+                            pass
+                            # # print("x0 requires grad iter %d" %k, x0.requires_grad)
+                            # # x0.detach_()
+                            # # print("x0 requires grad iter %d" %k, x0.requires_grad)
+                            # if loss < best_loss and loss > 0:
+                            #     best_x = x0.detach().clone() #please be careful with assignment, assignment or shallow copy will be bad!!
+                            #     best_loss = loss.detach()
+                            # elif loss < best_loss and loss < 0:
+                            #     print("IM HERE (iter %d)" %n)
+                            # elif loss < 0: #retry (but within the budget of 10 total gradient steps)
+                            #     init_x = np.random.normal(x[np.argmin(ts_ucb)], 0.2)
+                            #     x0 = torch.tensor(init_x, requires_grad=True,dtype=torch.float32)
+                            #     # x0 = x0.float()
+                            #     optimizer = torch.optim.Adam([x0], lr=0.01)
+                            #     optimizer.zero_grad()
+                            #     print("best_x and x0 same (by way of difference)? (shouldn't be)", best_x- x0)
+                        if k % 100 == 0 and k > 0:
+                            # print("maximum mu_x after training (iter %d), after %d steps" % (n,k), -loss)
+                            # print("argmax_mu_x", x0)
+                            _, sigma_mu_x = self.model.predict(x0,return_std=True)
+                            # print("sigma of argmax_mu_x", np.sqrt(sigma_mu_x))
+
+                    #insert the argmax_mu_x into the x array/also update the mu/sigma arrays. gotta include the best mu_x iterate into the Thompson Sampling!!! 
+                    # mu_x, sigma_mu_x = self.model.predict(x0,return_std=True)
+                    x = np.vstack((x,x0.detach().clone().numpy()))
+                    # print("x.shape at y idx %d" % i, x.shape)
+                    # mu = np.append(mu, mu_x)
+                    # sigma = np.append(sigma, sigma_mu_x)
+                    # if mu_x > mu_max_x:
+                    #     mu_max_x = mu_x
+                    #     sigma_max_x = sigma_mu_x
+
+
+
+        X = x[:]
+        if self._record_step:
+            X = np.append(self._grid, x).reshape(-1, self._dim)
+
+        # Calculate acquisition function
+        try:
+            x = self._acquisition_function(a, X, n)
+        except: #return random query if run into numerical issues
+            print("I am here")
+            return np.random.uniform(self.domain[:, 0], self.domain[:, 1], size=(self.n_workers, self._dim))
+        if self._record_step:
+            for acq_evaluation in self._acquisition_evaluations:
+                acq_evaluation.append(np.zeros_like(x))
+
+
+        return x
+
+    def optimize(self, n_iters, n_runs = 1, x0=None, random_search=100, plot = False, plot_freq = 30, n_pre_samples = 15,noise_scale = 1e-3):
+        """
+        Arguments:
+        ----------
+            n_iters: integer.
+                Number of iterations to run the search algorithm.
+            x0: array-like, shape = [n_pre_samples, n_params].
+                Array of initial points to sample the loss function for. If None, randomly
+                samples from the loss function.
+            n_pre_samples: integer.
+                If x0 is None, samples `n_pre_samples` initial points.
+            random_search: integer.
+                Flag that indicates whether to perform random search or L-BFGS-B to optimize the acquisition function.
+            plot: bool or integer
+                If integer, plot iterations with every plot number iteration. If True, plot every interation.
+        """
+
+        self._simple_regret = np.zeros((n_runs, n_iters+1))
+        self._simple_cumulative_regret = np.zeros((n_runs, n_iters + 1))
+        self._distance_traveled = np.zeros((n_runs, n_iters+1))
+
+
+        self.init_X = [[]for i in range(n_runs)]
+        self.init_Y = [[] for i in range(n_runs)]
+
+
+        print("Algorithm:%s" %self.acq_name)
+
+        #randomize before initial iterates chosen.
+        if self.seed != -1: #-1 for us means no extra seed here.
+            print("seed is", self.seed)
+            np.random.seed(self.seed)    
+
+        for i in range(n_runs):
+            if self.objective_name == 'robot3d' or self.objective_name == 'robot4d':
+                self.objective = self.objectives[i]
+                self.goal = self.goals[i]
+        # Initial data (for all n_runs, to ensure consistency of random seed)
+            if x0 is None:
+                for params in np.random.uniform(self.domain[:, 0], self.domain[:, 1], (n_pre_samples, self.domain.shape[0])):
+                    # print("i:%d" %i )
+                    # print("param", params)
+                    self.init_X[i].append(params)
+                    self.init_Y[i].append(self.objective(params))
+                    # print("i:%d done" %i )
+            else:
+                # Change definition of x0 to be specfic for each agent
+                for params in x0:
+                    self.init_X[i].append(params)
+                    self.init_Y[i].append(self.objective(params))
+
+        for run in tqdm(range(n_runs), position=0, leave = None, disable = not n_runs > 1):
+
+            if self.objective_name == 'robot3d' or self.objective_name == 'robot4d':
+                self.objective = self.objectives[run]
+
+            # Reset model and data before each run
+            self._next_query = []
+            # self.bc_data = [[[] for j in range(self.n_workers)] for i in range(self.n_workers)]
+            # self.X_train = []
+            # self.Y_train =[]
+            # self.X = []
+            # self.Y = []
+            self.X = self.init_X[run]
+            self.Y = self.init_Y[run]
+
+
+            # # Initial data
+            # if x0 is None:
+            #     for params in np.random.uniform(self.domain[:, 0], self.domain[:, 1], (n_pre_samples, self.domain.shape[0])):
+            #         self.X.append(params)
+            #         self.Y.append(self.objective(params))
+            # else:
+            #     # Change definition of x0 to be specfic for each agent
+            #     for params in x0:
+            #         self.X.append(params)
+            #         self.Y.append(self.objective(params))
+
+            self._initial_data_size = len(self.Y)
+
+            self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
+            eps_noise = np.random.normal(loc = 0, scale = noise_scale, size = (len(self.Y)))
+            # Standardize
+            Y = self.scaler[0].fit_transform(np.array(self.Y).reshape(-1, 1)).squeeze() + eps_noise
+            # Y = self.scaler[0].fit_transform(np.array(self.Y).reshape(-1, 1)).squeeze() #try no noise
+            # self.model = TorchGPModel(torch.tensor(self.X).float(), torch.tensor(Y).float())
+            # print("self objective_name", self.objective_name)
+            self.model = TorchGPModel(torch.tensor(self.X).float(), torch.tensor(Y).float(), 
+                alg_name = self.alg_name, n_workers =self.n_workers, objective_name = self.objective_name)
+            # self.model.train()
+            # self.likelihood.train()
+
+
+            for n in tqdm(range(n_iters+1), position = n_runs > 1, leave = None):
+
+                # record step indicator
+                self._record_step = False
+                if plot and run == 0 and self.domain.shape[0] <= 2: #for 3d and above, don't record step (i.e. don't plot)
+                        if n == n_iters or n % plot_freq == 0:
+                            self._record_step = True
+
+                # parallel/centralized decision
+                # if n > 0:
+                if n > 0:
+                    obs = [self.objective(q) for q in self._next_query]
+                    # print("iter %d obs, alg = %s" % (n,self.acq),obs)
+                    # print("obs", obs)
+                    self.X = self.X + [q for q in self._next_query]
+                    self.Y = self.Y + obs
+                    # print("iter %d max Y (true), alg = %s" % (n,self.acq), np.max(self.Y))
+                    # print("iter %d mean Y (true), alg = %s" %(n,self.acq), np.mean(self.Y))
+                    # print("iter %d std Y (true), alg = %s" %(n,self.acq), np.std(self.Y))
+                    # print("iter %d min Y (true), alg = %s" %(n,self.acq), np.min(self.Y))
+                # self.X_train = self.X_train + [q for q in self._next_query]
+                # self.Y_model(train = self.Y_train + obs
+                # Updata data knowledge
+                # if n == 0:
+                #     self.X_train = self.X
+                #     self.Y_train = self.Y
+
+                X = np.array(self.X)
+                eps_noise = np.random.normal(loc = 0, scale = noise_scale, size = (len(self.Y)))
+                # Standardize
+                Y = self.scaler[0].fit_transform(np.array(self.Y).reshape(-1, 1)).squeeze() + eps_noise
+                # Y = self.scaler[0].fit_transform(np.array(self.Y).reshape(-1, 1)).squeeze() #try no noise
+                # Fit surrogate
+                self.model.fit(X, Y)
+                # if n % 40 == 0:
+                # try not re-training
+                # if n % 30 == 0 and self.objective_name == 'rastrigin': #try more frequent updates
+                #     print("retraining!", self.acq_name)
+                #     self.model.train()
+
+                # Find next query
+                self._next_query = self._find_next_query(n, 0, random_search)
+
+                # Calculate regret
+                _simple_regret = self._regret(np.max(self.Y))
+                _simple_cumulative_regret = self._regret(np.max(self.Y))
+                # Calculate distance traveled
+                if not n:
+                    self._distance_traveled[run,n] = 0
+                else:
+                    if self.domain.shape[0] == 2: #for now, just ignore the distance travelled even for 2d
+                        # XinAgent = np.array(self.X[self._initial_data_size - self.n_workers:]).reshape([-1, self.n_workers, len(self.domain.shape)])
+                        # XinAgent = np.swapaxes(XinAgent, 0, 1)
+                        # self._distance_traveled[run,n] =  self._distance_traveled[run,n-1] + sum([np.linalg.norm(XinAgent[a][-2] - XinAgent[a][-1]) for a in range(self.n_workers)])
+                        self._distance_traveled[run,n] = -1 
+                    else: #for higher d (or 1d), ignore  the distance travelled for simplicity
+                        self._distance_traveled[run,n] = -1
+                # Plot optimization step
+                if self._record_step:
+                    self._plot_iteration(n, plot)
+
+                try:
+                    mu = self.model.predict(X)
+                    argmax_mean = X[np.argmax(mu)]
+                except:
+                    print("model no longer predicting (iter %d), giving an arbitrary argmax_mean" %n)
+                    argmax_mean = X[np.argmax(mu)]
+
+        # self.pre_arg_max = []
+        # self.pre_max = []
+        # for a in range(self.n_workers):
+        #     self.pre_arg_max.append(np.array(self.model[a].y_train_).argmax())
+        #     self.pre_max.append(self.model[a].X_train_[np.array(self.model[a].y_train_).argmax()]) todo: used for what?
+
+        # Compute and plot regret
+        # iter, r_mean, r_conf95 = self._mean_regret()
+        # self._plot_regret(iter, r_mean, r_conf95)
+        # iter, r_cum_mean, r_cum_conf95 = self._cumulative_regret()
+        # self._plot_regret(iter, r_cum_mean, r_cum_conf95, reward_type='cumulative')
+        #
+        # iter, d_mean, d_conf95 = self._mean_distance_traveled()
+
+        # Save data
+        # self._save_data(data = [iter, r_mean, r_conf95, d_mean, d_conf95, r_cum_mean, r_cum_conf95], name = 'data')
+                # if n > 0:
+                if n >= 0: #change to also record regret at first step, so everybody is the same.
+                    query_df_col_name = []
+                    obs_df_col_name = []
+                    for i in range(self.n_workers):
+                        if self.domain.shape[0] == 1:
+                            query_df_col_name = query_df_col_name + ['agent{}_x1'.format(i + 1)]
+                        if self.domain.shape[0] == 2:
+                            query_df_col_name = query_df_col_name + ['agent{}_x1'.format(i + 1), 'agent{}_x2'.format(i + 1)]
+                        elif self.domain.shape[0] == 3:
+                            query_df_col_name = query_df_col_name + ['agent{}_x1'.format(i + 1), 'agent{}_x2'.format(i + 1),'agent{}_x3'.format(i + 1)]
+                        elif self.domain.shape[0] >= 4:
+                            for j in np.arange(self.domain.shape[0]):
+                                query_df_col_name = query_df_col_name + ['agent{}_x{}'.format(i + 1, j+1)]
+                            # print("ERROR in DOMAIN FOR CSV!!!")
+                        obs_df_col_name = obs_df_col_name + ['agent{}_obs'.format(i + 1)]
+                        # print("query_df_col_name", query_df_col_name)
+                        # print("self._next_query", self._next_query)
+                    # print("self._next_query shape", self._next_query.shape)
+                    query_df = pd.DataFrame(np.asarray(self._next_query).reshape([1, -1]), columns=query_df_col_name)
+                    if n > 0:
+                        obs_df = pd.DataFrame(np.asarray(obs).reshape([1, -1]), columns=obs_df_col_name)
+                    else:
+                        obs_df = pd.DataFrame(np.zeros(self.n_workers).reshape([1, -1]), columns=obs_df_col_name)
+                    if self.domain.shape[0] == 2:
+                        data = dict(iteration=[n], runs=[run], alg=[self.alg_name], regret=[_simple_regret], distance_traveled=[self._distance_traveled[run, n]],
+                                argmax_mean_x1=[argmax_mean[0]], argmax_mean_x2=[argmax_mean[1]])
+                    elif self.domain.shape[0] == 1:
+                        data = dict(iteration=[n], runs=[run], alg=[self.alg_name], regret=[_simple_regret], distance_traveled=[self._distance_traveled[run, n]],
+                                argmax_mean_x1=[argmax_mean[0]])
+                    else:
+                        data = dict(iteration=[n], runs=[run], alg=[self.alg_name], regret=[_simple_regret],
+                            argmax_mean_x1=[argmax_mean[0]], argmax_mean_x2=[argmax_mean[1]],argmax_mean_x3=[argmax_mean[2]])
+                    df = pd.DataFrame().from_dict(data)
+                    total_df = pd.concat([df,obs_df, query_df],axis=1)
+                    filepath = os.path.join(self._DATA_DIR_, 'data_nruns=%s_n_agents=%s_n_ysamples=%d_seed=%d.csv' %(n_runs,self.n_workers,
+                        self.n_ysamples,self.seed))
+                    if run == 0 and n == 0:
+                        total_df.to_csv(filepath)
+                    else:
+                        total_df.to_csv(filepath, mode='a', header=False)
+
+        with open(self._DATA_DIR_ + '/config_seed=%d.json' % self.seed, 'w', encoding='utf-8') as file:
+            json.dump(vars(self.args), file, ensure_ascii=False, indent=4)
+
+            # Generate gif
+        # if plot and n_runs == 1:
+        #     self._generate_gif(n_iters, plot)
+
+
+    def _plot_iteration_old(self, iter, plot_iter):
+        """
+        Plots the surrogate and acquisition function.
+        """
+        mu = []
+        std = []
+        for a in range(self.n_workers):
+            try:
+                mu_a, std_a = self.model[a].predict(self._grid, return_std=True)
+            except:
+                print("Cannot predict while plotting iteration")
+                return
+            mu.append(mu_a)
+            std.append(std_a)
+            acq = [-1 * self._acquisition_evaluations[a][iter//plot_iter] for a in range(self.n_workers)]
+
+        for a in range(self.n_workers):
+            mu[a] = self.scaler[a].inverse_transform(mu[a].reshape(-1, 1))
+            std[a] = self.scaler[a].scale_ * std[a]
+
+        if self._dim == 1:
+            self._plot_1d(iter, mu, std, acq)
+        elif self._dim == 2:
+            self._plot_2d(iter, mu, acq)
+        else:
+            print("Can't plot for higher dimensional problems.")
+
+
+    def _plot_iteration(self, iter, plot_iter):
+        """
+        Plots the surrogate and acquisition function.
+        """
+        try:
+            mu, std = self.model.predict(self._grid, return_std=True)
+        except:
+            print("Cannot predict, so not plotting")
+            return
+
+
+        if self._dim == 1:
+            pass
+        elif self._dim == 2:
+            self._plot_2d(iter, mu) #.detach().numpy()
+        else:
+            print("Can't plot for higher dimensional problems.")
+
+    def _plot_2d(self, iter, mu, acq=None):
+
+        cmap = cm.get_cmap('jet')
+        rgba = [cmap(i) for i in np.linspace(0,1,self.n_workers)]
+        if self.n_workers == 1:
+            rgba = ['k']
+
+        class ScalarFormatterForceFormat(ticker.ScalarFormatter):
+            def _set_format(self):
+                self.format = "%1.2f"
+        fmt = ScalarFormatterForceFormat()
+        fmt.set_powerlimits((0,0))
+        fmt.useMathText = True
+
+        x = np.array(self.X)
+        y = np.array(self.Y)
+        # _next_query = np.array(self._next_query).reshape([3, -1])
+
+        first_param_grid = np.linspace(self.domain[0,0], self.domain[0,1], self._grid_density)
+        second_param_grid = np.linspace(self.domain[1,0], self.domain[1,1], self._grid_density)
+        # first_param_grid = np.linspace(-0.5, 0.5, self._grid_density)
+        # second_param_grid = np.linspace(-0.5, 0.5, self._grid_density)
+        X, Y = np.meshgrid(first_param_grid, second_param_grid, indexing='ij')
+
+        for a in range(1):
+
+            fig1, ax1 = plt.subplots(figsize=(4, 4), sharey=True) # , sharex=True
+            # plt.setp(ax.flat, aspect=1.0, adjustable='box')
+
+            N = 100
+            # Objective plot
+            Y_obj = [self.objective(i) for i in self._grid]
+            clev1 = np.linspace(min(Y_obj), max(Y_obj),N)
+            cp1 = ax1.contourf(X, Y, np.array(Y_obj).reshape(X.shape), clev1,  cmap = cm.coolwarm)
+            for c in cp1.collections:
+                c.set_edgecolor("face")
+            cbar1 = plt.colorbar(cp1, ax=ax1, shrink = 0.9, format=fmt, pad = 0.05, location='right')
+            cbar1.ax.tick_params(labelsize=10)
+            cbar1.ax.locator_params(nbins=5)
+            ax1.autoscale(False)
+            ax1.scatter(x[:, 0], x[:, 1], zorder=1, color = rgba[a], s = 10)
+            # ax1.axvline(self._next_query[a][0], color='k', linewidth=1)
+            # ax1.axhline(self._next_query[a][1], color='k', linewidth=1)
+            ax1.set_ylabel("y", fontsize = 10, rotation=0)
+            leg1 = ax1.legend(['Objective'], fontsize = 10, loc='upper right', handletextpad=0, handlelength=0, fancybox=True, framealpha = 0.2)
+            ax1.add_artist(leg1)
+            ax1.set_xlim([first_param_grid[0], first_param_grid[-1]])
+            ax1.set_ylim([second_param_grid[0], second_param_grid[-1]])
+            ax1.set_xticks(np.linspace(first_param_grid[0],first_param_grid[-1], 5))
+            ax1.set_yticks(np.linspace(second_param_grid[0],second_param_grid[-1], 5))
+            plt.setp(ax1.get_yticklabels()[0], visible=False)
+            ax1.tick_params(axis='both', which='both', labelsize=10)
+            ax1.scatter(self.arg_max[:,0], self.arg_max[:,1], marker='x', c='gold', s=30)
+
+            # if self.n_workers > 1:
+            #     ax1.legend(["Iteration %d" % (iter), "Entropy Search"], fontsize = 10, loc='upper left', handletextpad=0, handlelength=0, fancybox=True, framealpha = 0.2)
+            # else:
+            #     ax1.legend(["Iteration %d" % (iter)], fontsize = 10, loc='upper left', handletextpad=0, handlelength=0, fancybox=True, framealpha = 0.2)
+            ax1.legend([self.alg_name], fontsize=10, loc='upper left', handletextpad=0, handlelength=0,
+                       fancybox=True, framealpha=0.2)
+
+            ax1.tick_params(axis='both', which='major', labelsize=10)
+            ax1.tick_params(axis='both', which='minor', labelsize=10)
+            fig1.subplots_adjust(wspace=0, hspace=0)
+            ax1.yaxis.offsetText.set_fontsize(10)
+            plt.savefig(self._PDF_DIR_ + '/bo_iteration_%d_agent_%d_obj.pdf' % (iter, a), bbox_inches='tight')
+            plt.savefig(self._PNG_DIR_ + '/bo_iteration_%d_agent_%d_obj.png' % (iter, a), bbox_inches='tight')
+
+            # Surrogate plot
+            fig2, ax2 = plt.subplots(figsize=(4, 4), sharey=True)  # , sharex=True
+            d = 0
+            if mu.reshape(X.shape).max() - mu.reshape(X.shape).min() == 0:
+                d = mu.reshape(X.shape).max()*0.1
+            clev2 = np.linspace(mu.reshape(X.shape).min() - d, mu.reshape(X.shape).max() + d,N)
+            cp2 = ax2.contourf(X, Y, mu.reshape(X.shape), clev2,  cmap = cm.coolwarm)
+            for c in cp2.collections:
+                c.set_edgecolor("face")
+            cbar2 = plt.colorbar(cp2, ax=ax2, shrink = 0.9, format=fmt, pad = 0.05, location='right')
+            cbar2.ax.tick_params(labelsize=10)
+            cbar2.ax.locator_params(nbins=5)
+            ax2.autoscale(False)
+            ax2.scatter(x[:, 0], x[:, 1], zorder=1, color = rgba[a], s = 10)
+            if self._acquisition_function in ['es', 'ucb']:
+                ax2.scatter(self.amaxucb[0, 0], self.amaxucb[0, 1], marker='o', c='red', s=30)
+            # ax2.axvline(self._next_query[a][0], color='k', linewidth=1)
+            # ax2.axhline(self._next_query[a][1], color='k', linewidth=1)
+            ax2.set_ylabel("y", fontsize = 10, rotation=0)
+            ax2.legend(['Surrogate'], fontsize = 10, loc='upper right', handletextpad=0, handlelength=0, fancybox=True, framealpha = 0.2)
+            ax2.set_xlim([first_param_grid[0], first_param_grid[-1]])
+            ax2.set_ylim([second_param_grid[0], second_param_grid[-1]])
+            ax2.set_xticks(np.linspace(first_param_grid[0],first_param_grid[-1], 5))
+            ax2.set_yticks(np.linspace(second_param_grid[0],second_param_grid[-1], 5))
+            ax2.tick_params(axis='both', which='both', labelsize=10)
+            ax2.legend([self.alg_name], fontsize=10, loc='upper left', handletextpad=0, handlelength=0,
+                       fancybox=True, framealpha=0.2)
+            ax2.scatter(self.arg_max[:, 0], self.arg_max[:, 1], marker='x', c='gold', s=30)
+
+
+            ax2.tick_params(axis='both', which='major', labelsize=10)
+            ax2.tick_params(axis='both', which='minor', labelsize=10)
+            ax2.yaxis.offsetText.set_fontsize(10)
+            # ax3.yaxis.offsetText.set_fontsize(10)
+
+            fig2.subplots_adjust(wspace=0, hspace=0)
+            plt.savefig(self._PDF_DIR_ + '/bo_iteration_%d_agent_%d_sur.pdf' % (iter, a), bbox_inches='tight')
+            plt.savefig(self._PNG_DIR_ + '/bo_iteration_%d_agent_%d_sur.png' % (iter, a), bbox_inches='tight')
+
+
+
+

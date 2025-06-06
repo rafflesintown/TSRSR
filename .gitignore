@@ -1,0 +1,15 @@
+# Ignore PDF documents
+*.pdf
+
+# Ignore PNG images
+*.png
+
+# Ignore JPEG images
+*.jpg
+*.jpeg   # (add this if you sometimes use the longer extension)
+
+# Ignore Numpy-compressed arrays
+*.npz
+
+# Ignore csv
+*.csv
